@@ -2,11 +2,13 @@ using System.Text;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton(new SemaphoreSlim(1, 1));
 var app = builder.Build();
+const string LogFileName = "plex-media-play-webhooks.log";
 
 app.MapGet("/", () => Results.Ok("Plex webhook service is running."));
 
-app.MapPost("/webhooks/plex", async (HttpContext context, ILogger<Program> logger) =>
+app.MapPost("/webhooks/plex", async (HttpContext context, ILogger<Program> logger, SemaphoreSlim logWriteLock) =>
 {
     context.Request.EnableBuffering();
 
@@ -93,13 +95,22 @@ app.MapPost("/webhooks/plex", async (HttpContext context, ILogger<Program> logge
         }
     };
 
-    var logFilePath = Path.Combine(Path.GetTempPath(), "plex-media-play-webhooks.log");
+    var logFilePath = Path.Combine(Path.GetTempPath(), LogFileName);
     var entry = JsonSerializer.Serialize(capturedRequest, new JsonSerializerOptions
     {
         WriteIndented = true
     });
+    var logEntry = $"{entry}{Environment.NewLine}{new string('-', 80)}{Environment.NewLine}";
 
-    await File.AppendAllTextAsync(logFilePath, entry + Environment.NewLine + new string('-', 80) + Environment.NewLine);
+    await logWriteLock.WaitAsync(context.RequestAborted);
+    try
+    {
+        await File.AppendAllTextAsync(logFilePath, logEntry, context.RequestAborted);
+    }
+    finally
+    {
+        logWriteLock.Release();
+    }
 
     logger.LogInformation("Captured media.play event. Log file: {LogFilePath}", logFilePath);
 
