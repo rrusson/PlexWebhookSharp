@@ -17,5 +17,7 @@ Run locally:
 
 ```bash
 cd PlexWebhookSharp.Api
-dotnet run
+PlexWebhook__Secret=replace-with-a-secret dotnet run
 ```
+
+Configure Plex to include the matching `X-Plex-Webhook-Secret` header with webhook requests. Requests without the configured secret are rejected, and request bodies are limited to 1 MiB.

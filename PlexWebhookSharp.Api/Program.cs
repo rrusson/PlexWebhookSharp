@@ -1,19 +1,59 @@
 using System.Text;
 using System.Text.Json;
+using System.Security.Cryptography;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton(new SemaphoreSlim(1, 1));
+var webhookSecret = builder.Configuration["PlexWebhook:Secret"];
+if (string.IsNullOrWhiteSpace(webhookSecret))
+{
+    throw new InvalidOperationException("Configure the PlexWebhook:Secret setting before starting the service.");
+}
+
 var app = builder.Build();
 const string LogFileName = "plex-media-play-webhooks.log";
+const int MaxRequestBodySize = 1024 * 1024;
+var logWriteTimeout = TimeSpan.FromSeconds(10);
 
 app.MapGet("/", () => Results.Ok("Plex webhook service is running."));
 
 app.MapPost("/webhooks/plex", async (HttpContext context, ILogger<Program> logger, SemaphoreSlim logWriteLock) =>
 {
-    context.Request.EnableBuffering();
+    if (!context.Request.Headers.TryGetValue("X-Plex-Webhook-Secret", out var providedSecret)
+        || !CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(providedSecret.ToString()),
+            Encoding.UTF8.GetBytes(webhookSecret)))
+    {
+        return Results.Unauthorized();
+    }
 
+    if (context.Request.ContentLength > MaxRequestBodySize)
+    {
+        return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+    }
+
+    context.Request.EnableBuffering(bufferThreshold: 32 * 1024, bufferLimit: MaxRequestBodySize + 1);
     using var memoryStream = new MemoryStream();
-    await context.Request.Body.CopyToAsync(memoryStream);
+    var buffer = new byte[81920];
+    while (true)
+    {
+        var remainingBytes = MaxRequestBodySize + 1 - (int)memoryStream.Length;
+        var bytesRead = await context.Request.Body.ReadAsync(
+            buffer.AsMemory(0, Math.Min(buffer.Length, remainingBytes)),
+            context.RequestAborted);
+        if (bytesRead == 0)
+        {
+            break;
+        }
+
+        if (memoryStream.Length + bytesRead > MaxRequestBodySize)
+        {
+            return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+        }
+
+        await memoryStream.WriteAsync(buffer.AsMemory(0, bytesRead), context.RequestAborted);
+    }
+
     var rawBodyBytes = memoryStream.ToArray();
     context.Request.Body.Position = 0;
 
@@ -55,7 +95,9 @@ app.MapPost("/webhooks/plex", async (HttpContext context, ILogger<Program> logge
         try
         {
             using var payloadDocument = JsonDocument.Parse(payload);
-            if (payloadDocument.RootElement.TryGetProperty("event", out var eventProperty))
+            if (payloadDocument.RootElement.ValueKind == JsonValueKind.Object
+                && payloadDocument.RootElement.TryGetProperty("event", out var eventProperty)
+                && eventProperty.ValueKind == JsonValueKind.String)
             {
                 eventType = eventProperty.GetString();
             }
@@ -102,10 +144,11 @@ app.MapPost("/webhooks/plex", async (HttpContext context, ILogger<Program> logge
     });
     var logEntry = $"{entry}{Environment.NewLine}{new string('-', 80)}{Environment.NewLine}";
 
-    await logWriteLock.WaitAsync(context.RequestAborted);
+    using var writeTimeout = new CancellationTokenSource(logWriteTimeout);
+    await logWriteLock.WaitAsync(writeTimeout.Token);
     try
     {
-        await File.AppendAllTextAsync(logFilePath, logEntry, context.RequestAborted);
+        await File.AppendAllTextAsync(logFilePath, logEntry, writeTimeout.Token);
     }
     finally
     {
