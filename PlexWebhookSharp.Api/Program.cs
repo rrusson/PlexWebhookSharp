@@ -15,6 +15,8 @@ const string LogFileName = "plex-media-play-webhooks.log";
 const int MaxRequestBodySize = 1024 * 1024;
 var logWriteTimeout = TimeSpan.FromSeconds(10);
 
+app.UseStaticFiles();
+
 app.MapGet("/", () => Results.Ok("Plex webhook service is running."));
 
 app.MapPost("/webhooks/plex", async (HttpContext context, ILogger<Program> logger, SemaphoreSlim logWriteLock) =>
